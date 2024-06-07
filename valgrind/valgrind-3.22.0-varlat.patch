@@ -1,0 +1,648 @@
+--- valgrind-3.22.0/memcheck.orig/mc_errors.c
++++ valgrind-3.22.0/memcheck/mc_errors.c
+@@ -95,4 +95,5 @@
+       // - as a pointer in a load or store
+       // - as a jump target
++      // - (TIMECOP mode) as an operand in a variable-latency instruction
+       struct {
+          SizeT szB;   // size of value in bytes
+@@ -100,4 +101,6 @@
+          UInt        otag;      // origin tag
+          ExeContext* origin_ec; // filled in later
++         // TIMECOP mode
++         Bool        isLatency; // if issue is variable-latency instruction
+       } Value;
+ 
+@@ -490,6 +493,11 @@
+          if (xml) {
+             emit( "  <kind>UninitValue</kind>\n" );
+-            emit( "  <what>Use of uninitialised value of size %lu</what>\n",
+-                  extra->Err.Value.szB );
++            if (extra->Err.Value.isLatency)
++               emit( "  <what>Variable-latency instruction operand"
++                     " of size %lu is secret/uninitialised</what>\n",
++                     extra->Err.Value.szB );
++            else
++               emit( "  <what>Use of uninitialised value of size %lu</what>\n",
++                     extra->Err.Value.szB );
+             VG_(pp_ExeContext)( VG_(get_error_where)(err) );
+             if (extra->Err.Value.origin_ec)
+@@ -499,6 +507,11 @@
+             /* Could also show extra->Err.Cond.otag if debugging origin
+                tracking */
+-            emit( "Use of uninitialised value of size %lu\n",
+-                  extra->Err.Value.szB );
++            if (extra->Err.Value.isLatency)
++               emit( "Variable-latency instruction operand"
++                     " of size %lu is secret/uninitialised\n",
++                     extra->Err.Value.szB );
++            else
++               emit( "Use of uninitialised value of size %lu\n",
++                     extra->Err.Value.szB );
+             VG_(pp_ExeContext)( VG_(get_error_where)(err) );
+             if (extra->Err.Value.origin_ec)
+@@ -927,4 +940,18 @@
+    extra.Err.Value.otag      = otag;
+    extra.Err.Value.origin_ec = NULL;  /* Filled in later */
++   extra.Err.Value.isLatency = False;
++   VG_(maybe_record_error)( tid, Err_Value, /*addr*/0, /*s*/NULL, &extra );
++}
++
++void MC_(record_timecop_value_error) ( ThreadId tid, Int szB, UInt otag )
++{
++   MC_Error extra;
++   tl_assert( MC_(clo_mc_level) >= 2 );
++   if (otag > 0)
++      tl_assert( MC_(clo_mc_level) == 3 );
++   extra.Err.Value.szB       = szB;
++   extra.Err.Value.otag      = otag;
++   extra.Err.Value.origin_ec = NULL;  /* Filled in later */
++   extra.Err.Value.isLatency = True;
+    VG_(maybe_record_error)( tid, Err_Value, /*addr*/0, /*s*/NULL, &extra );
+ }
+--- valgrind-3.22.0/memcheck.orig/mc_include.h
++++ valgrind-3.22.0/memcheck/mc_include.h
+@@ -526,4 +526,8 @@
+ extern Bool MC_(any_value_errors);
+ 
++/* Are we running in TIMECOP mode, where variable-latency operations
++   on uninitialised (or secret) values are considered as errors ? */
++extern Bool MC_(timecop_mode);
++
+ /* Standard functions for error and suppressions as required by the
+    core/tool iface */
+@@ -553,4 +557,5 @@
+ void MC_(record_cond_error)    ( ThreadId tid, UInt otag );
+ void MC_(record_value_error)   ( ThreadId tid, Int szB, UInt otag );
++void MC_(record_timecop_value_error) ( ThreadId tid, Int szB, UInt otag );
+ void MC_(record_jump_error)    ( ThreadId tid, Addr a );
+ 
+@@ -774,4 +779,8 @@
+ VG_REGPARM(1) void MC_(helperc_value_check1_fail_w_o) ( UWord );
+ VG_REGPARM(1) void MC_(helperc_value_check0_fail_w_o) ( UWord );
++VG_REGPARM(2) void MC_(helperc_value_checkN_timecop_fail_w_o) ( HWord, UWord );
++VG_REGPARM(1) void MC_(helperc_value_check8_timecop_fail_w_o) ( UWord );
++VG_REGPARM(1) void MC_(helperc_value_check4_timecop_fail_w_o) ( UWord );
++VG_REGPARM(1) void MC_(helperc_value_check1_timecop_fail_w_o) ( UWord );
+ 
+ /* And call these ones instead to report an uninitialised value error
+@@ -782,4 +791,8 @@
+ VG_REGPARM(0) void MC_(helperc_value_check1_fail_no_o) ( void );
+ VG_REGPARM(0) void MC_(helperc_value_check0_fail_no_o) ( void );
++VG_REGPARM(1) void MC_(helperc_value_checkN_timecop_fail_no_o) ( HWord );
++VG_REGPARM(0) void MC_(helperc_value_check8_timecop_fail_no_o) ( void );
++VG_REGPARM(0) void MC_(helperc_value_check4_timecop_fail_no_o) ( void );
++VG_REGPARM(0) void MC_(helperc_value_check1_timecop_fail_no_o) ( void );
+ 
+ /* V-bits load/store helpers */
+--- valgrind-3.22.0/memcheck.orig/mc_main.c
++++ valgrind-3.22.0/memcheck/mc_main.c
+@@ -1258,4 +1258,15 @@
+ 
+ 
++/* --------------- TIMECOP. --------------- */
++
++Bool MC_(timecop_mode) = False;
++
++static Bool set_timecop_mode ( Bool enable )
++{
++    MC_(timecop_mode) = enable;
++    return True;
++}
++
++
+ /* --------------- Load/store slow cases. --------------- */
+ 
+@@ -5765,4 +5776,25 @@
+ }
+ 
++VG_REGPARM(1)
++void MC_(helperc_value_check1_timecop_fail_w_o) ( UWord origin ) {
++   MC_(record_timecop_value_error) ( VG_(get_running_tid)(), 1, (UInt)origin );
++}
++
++VG_REGPARM(1)
++void MC_(helperc_value_check4_timecop_fail_w_o) ( UWord origin ) {
++   MC_(record_timecop_value_error) ( VG_(get_running_tid)(), 4, (UInt)origin );
++}
++
++VG_REGPARM(1)
++void MC_(helperc_value_check8_timecop_fail_w_o) ( UWord origin ) {
++   MC_(record_timecop_value_error) ( VG_(get_running_tid)(), 8, (UInt)origin );
++}
++
++VG_REGPARM(2)
++void MC_(helperc_value_checkN_timecop_fail_w_o) ( HWord sz, UWord origin ) {
++   MC_(record_timecop_value_error) ( VG_(get_running_tid)(), (Int)sz,
++                                     (UInt)origin );
++}
++
+ /* ... and these when an origin isn't available. */
+ 
+@@ -5792,5 +5824,26 @@
+ }
+ 
++VG_REGPARM(0)
++void MC_(helperc_value_check1_timecop_fail_no_o) ( void ) {
++   MC_(record_timecop_value_error) ( VG_(get_running_tid)(), 1, 0/*origin*/ );
++}
+ 
++VG_REGPARM(0)
++void MC_(helperc_value_check4_timecop_fail_no_o) ( void ) {
++   MC_(record_timecop_value_error) ( VG_(get_running_tid)(), 4, 0/*origin*/ );
++}
++
++VG_REGPARM(0)
++void MC_(helperc_value_check8_timecop_fail_no_o) ( void ) {
++   MC_(record_timecop_value_error) ( VG_(get_running_tid)(), 8, 0/*origin*/ );
++}
++
++VG_REGPARM(1)
++void MC_(helperc_value_checkN_timecop_fail_no_o) ( HWord sz ) {
++   MC_(record_timecop_value_error) ( VG_(get_running_tid)(), (Int)sz,
++                                     0/*origin*/ );
++}
++
++
+ /*------------------------------------------------------------*/
+ /*--- Metadata get/set functions, for client requests.     ---*/
+@@ -6996,5 +7049,7 @@
+        && VG_USERREQ__GDB_MONITOR_COMMAND   != arg[0]
+        && VG_USERREQ__ENABLE_ADDR_ERROR_REPORTING_IN_RANGE != arg[0]
+-       && VG_USERREQ__DISABLE_ADDR_ERROR_REPORTING_IN_RANGE != arg[0])
++       && VG_USERREQ__DISABLE_ADDR_ERROR_REPORTING_IN_RANGE != arg[0]
++       && !VG_IS_TOOL_USERREQ(':','C',arg[0])
++       && VG_USERREQ__TIMECOP_MODE     != arg[0])
+       return False;
+ 
+@@ -7431,4 +7486,11 @@
+          Bool ok
+             = modify_ignore_ranges(addRange, arg[1], arg[2]);
++         *ret = ok ? 1 : 0;
++         return True;
++      }
++
++      case VG_USERREQ__TIMECOP_MODE: {
++         Bool enable = arg[1] != 0;
++         Bool ok = set_timecop_mode (enable);
+          *ret = ok ? 1 : 0;
+          return True;
+--- valgrind-3.22.0/memcheck.orig/mc_translate.c
++++ valgrind-3.22.0/memcheck/mc_translate.c
+@@ -1595,5 +1595,6 @@
+    |guard|.  The caller is assumed to have taken care of that already.
+ */
+-static void complainIfUndefined ( MCEnv* mce, IRAtom* atom, IRExpr *guard )
++static void doComplainIfUndefined ( MCEnv* mce, IRAtom* atom, IRExpr *guard,
++                                    Bool timecopLatency )
+ {
+    IRAtom*  vatom;
+@@ -1665,11 +1666,21 @@
+       case 1:
+          if (origin) {
+-            fn    = &MC_(helperc_value_check1_fail_w_o);
+-            nm    = "MC_(helperc_value_check1_fail_w_o)";
++            if (!timecopLatency) {
++               fn = &MC_(helperc_value_check1_fail_w_o);
++               nm = "MC_(helperc_value_check1_fail_w_o)";
++            } else {
++               fn = &MC_(helperc_value_check1_timecop_fail_w_o);
++               nm = "MC_(helperc_value_check1_timecop_fail_w_o)";
++            }
+             args  = mkIRExprVec_1(origin);
+             nargs = 1;
+          } else {
+-            fn    = &MC_(helperc_value_check1_fail_no_o);
+-            nm    = "MC_(helperc_value_check1_fail_no_o)";
++            if (!timecopLatency) {
++               fn = &MC_(helperc_value_check1_fail_no_o);
++               nm = "MC_(helperc_value_check1_fail_no_o)";
++            } else {
++               fn = &MC_(helperc_value_check1_timecop_fail_no_o);
++               nm = "MC_(helperc_value_check1_timecop_fail_no_o)";
++            }
+             args  = mkIRExprVec_0();
+             nargs = 0;
+@@ -1678,11 +1689,21 @@
+       case 4:
+          if (origin) {
+-            fn    = &MC_(helperc_value_check4_fail_w_o);
+-            nm    = "MC_(helperc_value_check4_fail_w_o)";
++            if (!timecopLatency) {
++               fn = &MC_(helperc_value_check4_fail_w_o);
++               nm = "MC_(helperc_value_check4_fail_w_o)";
++            } else {
++               fn = &MC_(helperc_value_check4_timecop_fail_w_o);
++               nm = "MC_(helperc_value_check4_timecop_fail_w_o)";
++            }
+             args  = mkIRExprVec_1(origin);
+             nargs = 1;
+          } else {
+-            fn    = &MC_(helperc_value_check4_fail_no_o);
+-            nm    = "MC_(helperc_value_check4_fail_no_o)";
++            if (!timecopLatency) {
++               fn = &MC_(helperc_value_check4_fail_no_o);
++               nm = "MC_(helperc_value_check4_fail_no_o)";
++            } else {
++               fn = &MC_(helperc_value_check4_timecop_fail_no_o);
++               nm = "MC_(helperc_value_check4_timecop_fail_no_o)";
++            }
+             args  = mkIRExprVec_0();
+             nargs = 0;
+@@ -1691,11 +1712,21 @@
+       case 8:
+          if (origin) {
+-            fn    = &MC_(helperc_value_check8_fail_w_o);
+-            nm    = "MC_(helperc_value_check8_fail_w_o)";
++            if (!timecopLatency) {
++               fn = &MC_(helperc_value_check8_fail_w_o);
++               nm = "MC_(helperc_value_check8_fail_w_o)";
++            } else {
++               fn = &MC_(helperc_value_check8_timecop_fail_w_o);
++               nm = "MC_(helperc_value_check8_timecop_fail_w_o)";
++            }
+             args  = mkIRExprVec_1(origin);
+             nargs = 1;
+          } else {
+-            fn    = &MC_(helperc_value_check8_fail_no_o);
+-            nm    = "MC_(helperc_value_check8_fail_no_o)";
++            if (!timecopLatency) {
++                fn = &MC_(helperc_value_check8_fail_no_o);
++                nm = "MC_(helperc_value_check8_fail_no_o)";
++            } else {
++                fn = &MC_(helperc_value_check8_timecop_fail_no_o);
++                nm = "MC_(helperc_value_check8_timecop_fail_no_o)";
++            }
+             args  = mkIRExprVec_0();
+             nargs = 0;
+@@ -1705,11 +1736,21 @@
+       case 16:
+          if (origin) {
+-            fn    = &MC_(helperc_value_checkN_fail_w_o);
+-            nm    = "MC_(helperc_value_checkN_fail_w_o)";
++            if (!timecopLatency) {
++               fn = &MC_(helperc_value_checkN_fail_w_o);
++               nm = "MC_(helperc_value_checkN_fail_w_o)";
++            } else {
++               fn = &MC_(helperc_value_checkN_timecop_fail_w_o);
++               nm = "MC_(helperc_value_checkN_timecop_fail_w_o)";
++            }
+             args  = mkIRExprVec_2( mkIRExpr_HWord( sz ), origin);
+             nargs = 2;
+          } else {
+-            fn    = &MC_(helperc_value_checkN_fail_no_o);
+-            nm    = "MC_(helperc_value_checkN_fail_no_o)";
++            if (!timecopLatency) {
++               fn = &MC_(helperc_value_checkN_fail_no_o);
++               nm = "MC_(helperc_value_checkN_fail_no_o)";
++            } else {
++               fn = &MC_(helperc_value_checkN_timecop_fail_no_o);
++               nm = "MC_(helperc_value_checkN_timecop_fail_no_o)";
++            }
+             args  = mkIRExprVec_1( mkIRExpr_HWord( sz ) );
+             nargs = 1;
+@@ -1772,5 +1813,16 @@
+ }
+ 
++static void complainIfUndefined ( MCEnv* mce, IRAtom* atom, IRExpr *guard )
++{
++   doComplainIfUndefined(mce, atom, guard, False);
++}
+ 
++static void complainIfVariableLatency ( MCEnv* mce, IRAtom* atom )
++{
++   if (MC_(timecop_mode))
++      doComplainIfUndefined(mce, atom, NULL, True);
++}
++
++
+ /*------------------------------------------------------------*/
+ /*--- Shadowing PUTs/GETs, and indexed variants thereof    ---*/
+@@ -3512,12 +3564,17 @@
+       case Iop_Yl2xp1F64:
+       case Iop_AtanF64:
+-      case Iop_PRemF64:
+-      case Iop_PRem1F64:
+       case Iop_QuantizeD64:
+          /* I32(rm) x F64/D64 x F64/D64 -> F64/D64 */
+          return mkLazy3(mce, Ity_I64, vatom1, vatom2, vatom3);
++      case Iop_PRemF64:
++      case Iop_PRem1F64:
++         complainIfVariableLatency(mce, atom2);
++         complainIfVariableLatency(mce, atom3);
++         return mkLazy3(mce, Ity_I64, vatom1, vatom2, vatom3);
+       case Iop_PRemC3210F64:
+       case Iop_PRem1C3210F64:
+          /* I32(rm) x F64 x F64 -> I32 */
++         complainIfVariableLatency(mce, atom2);
++         complainIfVariableLatency(mce, atom3);
+          return mkLazy3(mce, Ity_I32, vatom1, vatom2, vatom3);
+       case Iop_AddF32:
+@@ -3573,19 +3630,31 @@
+       case Iop_Sub64Fx2:
+       case Iop_Mul64Fx2:
+-      case Iop_Div64Fx2:
+       case Iop_Scale2_64Fx2:
+          return binary64Fx2_w_rm(mce, vatom1, vatom2, vatom3);
+ 
++      case Iop_Div64Fx2:
++         complainIfVariableLatency(mce, atom2);
++         complainIfVariableLatency(mce, atom3);
++         return binary64Fx2_w_rm(mce, vatom1, vatom2, vatom3);
++
+       case Iop_Add32Fx4:
+       case Iop_Sub32Fx4:
+       case Iop_Mul32Fx4:
+-      case Iop_Div32Fx4:
+       case Iop_Scale2_32Fx4:
+-        return binary32Fx4_w_rm(mce, vatom1, vatom2, vatom3);
++         return binary32Fx4_w_rm(mce, vatom1, vatom2, vatom3);
+ 
++      case Iop_Div32Fx4:
++         complainIfVariableLatency(mce, atom2);
++         complainIfVariableLatency(mce, atom3);
++         return binary32Fx4_w_rm(mce, vatom1, vatom2, vatom3);
++
+       case Iop_Add64Fx4:
+       case Iop_Sub64Fx4:
+       case Iop_Mul64Fx4:
++         return binary64Fx4_w_rm(mce, vatom1, vatom2, vatom3);
++
+       case Iop_Div64Fx4:
++         complainIfVariableLatency(mce, atom2);
++         complainIfVariableLatency(mce, atom3);
+          return binary64Fx4_w_rm(mce, vatom1, vatom2, vatom3);
+ 
+@@ -3595,10 +3664,14 @@
+       case Iop_Add16Fx8:
+       case Iop_Sub16Fx8:
+-        return binary16Fx8_w_rm(mce, vatom1, vatom2, vatom3);
++         return binary16Fx8_w_rm(mce, vatom1, vatom2, vatom3);
+ 
+       case Iop_Add32Fx8:
+       case Iop_Sub32Fx8:
+       case Iop_Mul32Fx8:
++         return binary32Fx8_w_rm(mce, vatom1, vatom2, vatom3);
++
+       case Iop_Div32Fx8:
++         complainIfVariableLatency(mce, atom2);
++         complainIfVariableLatency(mce, atom3);
+          return binary32Fx8_w_rm(mce, vatom1, vatom2, vatom3);
+ 
+@@ -3914,9 +3987,13 @@
+       case Iop_I32StoF32x4:
+       case Iop_F32toI32Sx4:
++         return unary16Fx8_w_rm(mce, vatom1, vatom2);
+       case Iop_Sqrt16Fx8:
++         complainIfVariableLatency(mce, atom2);
+          return unary16Fx8_w_rm(mce, vatom1, vatom2);
+       case Iop_Sqrt32Fx4:
++         complainIfVariableLatency(mce, atom2);
+          return unary32Fx4_w_rm(mce, vatom1, vatom2);
+       case Iop_Sqrt64Fx2:
++         complainIfVariableLatency(mce, atom2);
+          return unary64Fx2_w_rm(mce, vatom1, vatom2);
+ 
+@@ -4154,4 +4231,6 @@
+       case Iop_ModS128:
+          /* I128 x I128 -> I128 */
++         complainIfVariableLatency(mce, atom1);
++         complainIfVariableLatency(mce, atom2);
+          return mkLazy2(mce, Ity_V128, vatom1, vatom2);
+ 
+@@ -4185,5 +4264,4 @@
+       case Iop_Min64F0x2:
+       case Iop_Max64F0x2:
+-      case Iop_Div64F0x2:
+       case Iop_CmpLT64F0x2:
+       case Iop_CmpLE64F0x2:
+@@ -4193,4 +4271,9 @@
+          return binary64F0x2(mce, vatom1, vatom2);      
+ 
++      case Iop_Div64F0x2:
++         complainIfVariableLatency(mce, atom1);
++         complainIfVariableLatency(mce, atom2);
++         return binary64F0x2(mce, vatom1, vatom2);      
++
+       case Iop_Min32Fx4:
+       case Iop_Max32Fx4:
+@@ -4221,5 +4304,4 @@
+       case Iop_Min32F0x4:
+       case Iop_Max32F0x4:
+-      case Iop_Div32F0x4:
+       case Iop_CmpLT32F0x4:
+       case Iop_CmpLE32F0x4:
+@@ -4229,4 +4311,9 @@
+          return binary32F0x4(mce, vatom1, vatom2);      
+ 
++      case Iop_Div32F0x4:
++         complainIfVariableLatency(mce, atom1);
++         complainIfVariableLatency(mce, atom2);
++         return binary32F0x4(mce, vatom1, vatom2);      
++
+       case Iop_QShlNsatSU8x16:
+       case Iop_QShlNsatUU8x16:
+@@ -4532,9 +4619,12 @@
+       case Iop_TanF64:
+       case Iop_2xm1F64:
+-      case Iop_SqrtF64:
+       case Iop_RecpExpF64:
+          /* I32(rm) x I64/F64 -> I64/F64 */
+          return mkLazy2(mce, Ity_I64, vatom1, vatom2);
+ 
++      case Iop_SqrtF64:
++         complainIfVariableLatency(mce, atom2);
++         return mkLazy2(mce, Ity_I64, vatom1, vatom2);
++
+       case Iop_ShlD64:
+       case Iop_ShrD64:
+@@ -4590,14 +4680,19 @@
+       case Iop_SqrtF16:
+          /* I32(rm) x F16 -> F16 */
++         complainIfVariableLatency(mce, atom2);
+          return mkLazy2(mce, Ity_I16, vatom1, vatom2);
+ 
+       case Iop_RoundF32toInt:
+-      case Iop_SqrtF32:
+       case Iop_RecpExpF32:
+          /* I32(rm) x I32/F32 -> I32/F32 */
+          return mkLazy2(mce, Ity_I32, vatom1, vatom2);
+ 
++      case Iop_SqrtF32:
++         complainIfVariableLatency(mce, atom2);
++         return mkLazy2(mce, Ity_I32, vatom1, vatom2);
++
+       case Iop_SqrtF128:
+          /* I32(rm) x F128 -> F128 */
++         complainIfVariableLatency(mce, atom2);
+          return mkLazy2(mce, Ity_I128, vatom1, vatom2);
+ 
+@@ -4688,8 +4783,12 @@
+       case Iop_DivModU64to32:
+       case Iop_DivModS64to32:
++         complainIfVariableLatency(mce, atom1);
++         complainIfVariableLatency(mce, atom2);
+          return mkLazy2(mce, Ity_I64, vatom1, vatom2);
+ 
+       case Iop_DivModU128to64:
+       case Iop_DivModS128to64:
++         complainIfVariableLatency(mce, atom1);
++         complainIfVariableLatency(mce, atom2);
+          return mkLazy2(mce, Ity_I128, vatom1, vatom2);
+ 
+@@ -4703,4 +4802,6 @@
+       case Iop_DivModU64to64:
+       case Iop_DivModS64to64: {
++         complainIfVariableLatency(mce, atom1);
++         complainIfVariableLatency(mce, atom2);
+          IRAtom* vTmp64 = mkLazy2(mce, Ity_I64, vatom1, vatom2);
+          return assignNew('V', mce, Ity_I128,
+@@ -4718,4 +4819,6 @@
+       case Iop_DivModU32to32:
+       case Iop_DivModS32to32: {
++         complainIfVariableLatency(mce, atom1);
++         complainIfVariableLatency(mce, atom2);
+          IRAtom* vTmp32 = mkLazy2(mce, Ity_I32, vatom1, vatom2);
+          return assignNew('V', mce, Ity_I64,
+@@ -4747,10 +4850,14 @@
+ 
+       case Iop_Sad8Ux4: /* maybe we could do better?  ftm, do mkLazy2. */
++      case Iop_QAdd32S: /* could probably do better */
++      case Iop_QSub32S: /* could probably do better */
++         return mkLazy2(mce, Ity_I32, vatom1, vatom2);
++
+       case Iop_DivS32:
+       case Iop_DivU32:
+       case Iop_DivU32E:
+       case Iop_DivS32E:
+-      case Iop_QAdd32S: /* could probably do better */
+-      case Iop_QSub32S: /* could probably do better */
++         complainIfVariableLatency(mce, atom1);
++         complainIfVariableLatency(mce, atom2);
+          return mkLazy2(mce, Ity_I32, vatom1, vatom2);
+ 
+@@ -4759,4 +4866,6 @@
+       case Iop_DivS64E:
+       case Iop_DivU64E:
++         complainIfVariableLatency(mce, atom1);
++         complainIfVariableLatency(mce, atom2);
+          return mkLazy2(mce, Ity_I64, vatom1, vatom2);
+ 
+@@ -5164,7 +5273,11 @@
+ 
+       case Iop_Sqrt64F0x2:
++         complainIfVariableLatency(mce, atom);
+          return unary64F0x2(mce, vatom);
+ 
+       case Iop_Sqrt32Fx8:
++         complainIfVariableLatency(mce, atom);
++         return unary32Fx8(mce, vatom);
++
+       case Iop_RSqrtEst32Fx8:
+       case Iop_RecipEst32Fx8:
+@@ -5172,4 +5285,5 @@
+ 
+       case Iop_Sqrt64Fx4:
++         complainIfVariableLatency(mce, atom);
+          return unary64Fx4(mce, vatom);
+ 
+@@ -5201,4 +5315,7 @@
+ 
+       case Iop_Sqrt32F0x4:
++         complainIfVariableLatency(mce, atom);
++         return unary32F0x4(mce, vatom);
++
+       case Iop_RSqrtEst32F0x4:
+       case Iop_RecipEst32F0x4:
+@@ -8041,5 +8158,5 @@
+ {
+    /* This is expensive because it happens a lot.  We are checking to
+-      see whether |name| is one of the following 8 strings:
++      see whether |name| is one of the following 14 strings:
+ 
+          MC_(helperc_value_check8_fail_no_o)
+@@ -8048,10 +8165,16 @@
+          MC_(helperc_value_check1_fail_no_o)
+          MC_(helperc_value_check8_fail_w_o)
++         MC_(helperc_value_check4_fail_w_o)
+          MC_(helperc_value_check0_fail_w_o)
+          MC_(helperc_value_check1_fail_w_o)
+-         MC_(helperc_value_check4_fail_w_o)
++         MC_(helperc_value_check8_timecop_fail_no_o)
++         MC_(helperc_value_check4_timecop_fail_no_o)
++         MC_(helperc_value_check1_timecop_fail_no_o)
++         MC_(helperc_value_check8_timecop_fail_w_o)
++         MC_(helperc_value_check4_timecop_fail_w_o)
++         MC_(helperc_value_check1_timecop_fail_w_o)
+ 
+       To speed it up, check the common prefix just once, rather than
+-      all 8 times.
++      all 14 times.
+    */
+    const HChar* prefix = "MC_(helperc_value_check";
+@@ -8078,5 +8201,11 @@
+           || 0==VG_(strcmp)(name, "4_fail_w_o)")
+           || 0==VG_(strcmp)(name, "0_fail_w_o)")
+-          || 0==VG_(strcmp)(name, "1_fail_w_o)");
++          || 0==VG_(strcmp)(name, "1_fail_w_o)")
++          || 0==VG_(strcmp)(name, "8_timecop_fail_no_o)")
++          || 0==VG_(strcmp)(name, "4_timecop_fail_no_o)")
++          || 0==VG_(strcmp)(name, "1_timecop_fail_no_o)")
++          || 0==VG_(strcmp)(name, "8_timecop_fail_w_o)")
++          || 0==VG_(strcmp)(name, "4_timecop_fail_w_o)")
++          || 0==VG_(strcmp)(name, "1_timecop_fail_w_o)");
+ }
+ 
+@@ -8144,5 +8273,5 @@
+       tl_assert((_expected) == is_helperc_value_checkN_fail(_string))
+ 
+-   /* It should identify these 8, and no others, as targets. */
++   /* It should identify these 14, and no others, as targets. */
+    CHECK(True, "MC_(helperc_value_check8_fail_no_o)");
+    CHECK(True, "MC_(helperc_value_check4_fail_no_o)");
+@@ -8153,4 +8282,10 @@
+    CHECK(True, "MC_(helperc_value_check1_fail_w_o)");
+    CHECK(True, "MC_(helperc_value_check4_fail_w_o)");
++   CHECK(True, "MC_(helperc_value_check8_timecop_fail_no_o)");
++   CHECK(True, "MC_(helperc_value_check4_timecop_fail_no_o)");
++   CHECK(True, "MC_(helperc_value_check1_timecop_fail_no_o)");
++   CHECK(True, "MC_(helperc_value_check8_timecop_fail_w_o)");
++   CHECK(True, "MC_(helperc_value_check1_timecop_fail_w_o)");
++   CHECK(True, "MC_(helperc_value_check4_timecop_fail_w_o)");
+ 
+    /* Ad-hoc selection of other strings gathered via a quick test. */
+--- valgrind-3.22.0/memcheck.orig/memcheck.h
++++ valgrind-3.22.0/memcheck/memcheck.h
+@@ -1,2 +1,5 @@
++/*
++   Modified 2024 by ANONYMOUS to add TIMECOP mode client request.
++ */
+ 
+ /*
+@@ -103,5 +106,8 @@
+       _VG_USERREQ__MEMCHECK_RECORD_OVERLAP_ERROR 
+          = VG_USERREQ_TOOL_BASE('M','C') + 256,
+-      _VG_USERREQ__MEMCHECK_VERIFY_ALIGNMENT
++      _VG_USERREQ__MEMCHECK_VERIFY_ALIGNMENT,
++
++      /* TIMECOP */
++      VG_USERREQ__TIMECOP_MODE = VG_USERREQ_TOOL_BASE(':','C'),
+    } Vg_MemCheckClientRequest;
+ 
+@@ -306,4 +312,16 @@
+        VG_USERREQ__ENABLE_ADDR_ERROR_REPORTING_IN_RANGE,       \
+        (_qzz_addr), (_qzz_len), 0, 0, 0)
++
++/* Enable check for undefined data fed to variable-latency
++   instructions. */
++#define VALGRIND_ENABLE_TIMECOP_MODE                           \
++    VALGRIND_DO_CLIENT_REQUEST_EXPR(0 /* default return */,    \
++       VG_USERREQ__TIMECOP_MODE, 1, 0, 0, 0, 0)
++
++/* Disable check for undefined data fed to variable-latency
++   instructions. */
++#define VALGRIND_DISABLE_TIMECOP_MODE                          \
++    VALGRIND_DO_CLIENT_REQUEST_EXPR(0 /* default return */,    \
++       VG_USERREQ__TIMECOP_MODE, 0, 0, 0, 0, 0)
+ 
+ #endif
