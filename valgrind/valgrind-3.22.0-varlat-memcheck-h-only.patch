@@ -1,0 +1,38 @@
+SPDX-License-Identifer: bzip2-1.0.6
+SPDX-FileCopyrightText: 2024 Tee Kiah Chia <tkchia@ntu.edu.sg>
+
+--- valgrind-3.22.0/memcheck.orig/memcheck.h
++++ valgrind-3.22.0/memcheck/memcheck.h
+@@ -1,2 +1,5 @@
++/*
++   Modified 2024 by Tee-Kiah Chia to add TIMECOP mode client request.
++ */
+ 
+ /*
+@@ -103,5 +106,8 @@
+       _VG_USERREQ__MEMCHECK_RECORD_OVERLAP_ERROR 
+          = VG_USERREQ_TOOL_BASE('M','C') + 256,
+-      _VG_USERREQ__MEMCHECK_VERIFY_ALIGNMENT
++      _VG_USERREQ__MEMCHECK_VERIFY_ALIGNMENT,
++
++      /* TIMECOP */
++      VG_USERREQ__TIMECOP_MODE = VG_USERREQ_TOOL_BASE(':','C'),
+    } Vg_MemCheckClientRequest;
+ 
+@@ -306,4 +312,16 @@
+        VG_USERREQ__ENABLE_ADDR_ERROR_REPORTING_IN_RANGE,       \
+        (_qzz_addr), (_qzz_len), 0, 0, 0)
++
++/* Enable check for undefined data fed to variable-latency
++   instructions. */
++#define VALGRIND_ENABLE_TIMECOP_MODE                           \
++    VALGRIND_DO_CLIENT_REQUEST_EXPR(0 /* default return */,    \
++       VG_USERREQ__TIMECOP_MODE, 1, 0, 0, 0, 0)
++
++/* Disable check for undefined data fed to variable-latency
++   instructions. */
++#define VALGRIND_DISABLE_TIMECOP_MODE                          \
++    VALGRIND_DO_CLIENT_REQUEST_EXPR(0 /* default return */,    \
++       VG_USERREQ__TIMECOP_MODE, 0, 0, 0, 0, 0)
+ 
+ #endif

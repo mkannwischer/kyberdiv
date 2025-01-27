@@ -1,16 +1,17 @@
 To use our valgrind patch, you'll have to re-compile valgrind following these steps:
 
-- Download and unpack Valgrind revision `090f8ce59b5f3d3ec39e032ee5e9524ce4f51a44`
+- Download and unpack Valgrind version VALGRIND_3_22_0
+
 
 ```
 git clone https://sourceware.org/git/valgrind.git
 cd valgrind
-git checkout 090f8ce59b5f3d3ec39e032ee5e9524ce4f51a44
+git checkout VALGRIND_3_22_0
 ```
 - Apply the patch
 ```
-  `patch -p1 <`_path-to_`/valgrind-varlat-patch-20240808.txt`
-```
+  `patch -p1 <`_path-to_`/valgrind-3.22.0-varlat.patch`
+	```
 
 - Build and install Valgrind, per instructions in Valgrind's own `README` file.  Some additional tips:
   - `./configure --help` should give further options on how to build Valgrind.
